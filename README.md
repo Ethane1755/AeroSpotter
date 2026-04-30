@@ -1,0 +1,12 @@
+### Files
+- /database
+  - static database for reference
+  - recommended: keep the large aircraft DB as `aircraft-database-complete-2025-08.csv.gz`
+- /server
+  - server side scripts, the real files are on my NAS
+  - api.py: expose the api tools for cli to call
+  - ingest.sh: pull the dynamic database from github and store them in SQL format (on NAS)
+- /test
+  - test images
+- cli.py
+  - main script
