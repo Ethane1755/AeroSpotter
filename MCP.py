@@ -284,7 +284,7 @@ def _extract_registration_with_local_ocr(
         return None, "OCR subprocess returned no registration marker"
 
     try:
-        from ocr_pipeline import extract_registration_mark
+        from OCR import extract_registration_mark
     except Exception as e:
         return None, f"OCR module import failed: {e}"
 
