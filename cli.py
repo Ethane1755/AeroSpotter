@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import csv
 import gzip
+import hashlib
 import importlib
 import json
 import math
+import os
 import re
+import sys
 import threading
+import time
 import webbrowser
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -28,9 +33,51 @@ from zoneinfo import ZoneInfo
 import requests
 import typer
 
+from ocr_pipeline import extract_registration_marks
+YOLO_WEIGHTS_PATH = os.environ.get("YOLO_WEIGHTS_PATH", "yolo weights/best.pt")
+
+def _load_dotenv_file(env_path: Path) -> None:
+    if not env_path.exists():
+        return
+
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("export "):
+                stripped = stripped[len("export "):].strip()
+            if "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            key = key.strip()
+            if not key:
+                continue
+            value = value.strip().strip('"').strip("'")
+            os.environ.setdefault(key, value)
+    except OSError:
+        return
+
+
+def _get_gemini_api_key() -> str:
+    return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+
+
+def _is_traffic_supported_python() -> bool:
+    # traffic+pandas stack is not stable yet on bleeding-edge Python builds.
+    return sys.version_info < (3, 13)
+
+
+def _traffic_python_hint() -> str:
+    current = f"{sys.version_info.major}.{sys.version_info.minor}"
+    return f"目前 Python={current}；建議切換到 Python 3.12 後再啟用 traffic"
+
+
 # Application setup and shared configuration.
 app = typer.Typer(help="AeroSpotter CLI (Home Lab NAS Edition)")
 console = Console()
+
+_load_dotenv_file(Path(__file__).parent / ".env")
 
 NAS_API_URL = "http://100.109.73.11:5000/api/adsb/bbox"
 BUFFER_MINUTES = 5
@@ -93,6 +140,43 @@ DB_DIR = Path(__file__).parent / "database"
 AIRLINE_MAP_PATH = DB_DIR / "iata_airlines.csv"
 LOCAL_DB_GZ_PATH = DB_DIR / "aircraft-database-complete-2025-08.csv.gz"
 LOCAL_DB_CSV_FALLBACK_PATH = DB_DIR / "aircraft-database-complete-2025-08.csv"
+LOG_DIR = Path(__file__).parent / "logs"
+DECISION_LOG_PATH = LOG_DIR / "vlm_decision.log"
+VLM_CACHE_PATH = LOG_DIR / "vlm_cache.json"
+MCP_SERVER_SCRIPT = Path(__file__).parent / "Airplane_MCP.py"
+VLM_TOOL_NAME = "analyze_airplane_image"
+VLM_MIN_SCORE = int(os.environ.get("VLM_MIN_SCORE", "4"))
+VLM_SCORE_MARGIN = int(os.environ.get("VLM_SCORE_MARGIN", "2"))
+VLM_MCP_TIMEOUT_SECONDS = int(os.environ.get("VLM_MCP_TIMEOUT_SECONDS", "20"))
+VLM_DIRECT_TIMEOUT_SECONDS = int(os.environ.get("VLM_DIRECT_TIMEOUT_SECONDS", "60"))
+VLM_DIRECT_TIMEOUT_GRACE_SECONDS = float(os.environ.get("VLM_DIRECT_TIMEOUT_GRACE_SECONDS", "8"))
+VLM_MAX_IMAGE_EDGE = int(os.environ.get("VLM_MAX_IMAGE_EDGE", "1024"))
+VLM_ALLOW_LOW_CONF_AIRLINE_EXACT = os.environ.get("VLM_ALLOW_LOW_CONF_AIRLINE_EXACT", "1") == "1"
+VLM_SERVER_RETRY_ATTEMPTS = max(1, int(os.environ.get("VLM_SERVER_RETRY_ATTEMPTS", "3")))
+VLM_SERVER_RETRY_BASE_SECONDS = float(os.environ.get("VLM_SERVER_RETRY_BASE_SECONDS", "1.0"))
+VLM_SERVER_RETRY_MAX_SECONDS = float(os.environ.get("VLM_SERVER_RETRY_MAX_SECONDS", "8.0"))
+VLM_MODEL_PRIMARY = os.environ.get("VLM_MODEL_PRIMARY", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+VLM_MODEL_BACKUP = os.environ.get("VLM_MODEL_BACKUP", "gemini-3-flash").strip() or "gemini-3-flash"
+VLM_PROMPT_TEXT = """
+You are a professional aviation photography analysis assistant. Please observe this airplane photo and provide the following information as much as possible:
+1. Registration Number: Usually located under the tail. If it's unclear, please provide any partial string you can barely recognize.
+2. Airline/Livery: Please identify this based on the text on the fuselage or the tail logo.
+3. Aircraft Type: Infer the base aircraft type (e.g., Boeing 777, Airbus A320, etc.) through engine features, landing gear, and fuselage shape.
+
+Please return the result STRICTLY in JSON format as follows:
+{
+    "callsign": "string or null",
+    "registration_number": "string or null",
+    "airline": "airline name",
+    "aircraft_type": "aircraft type"
+}
+
+Rules:
+- Output JSON only.
+- Do not include any explanation.
+- Do not wrap with markdown code fences.
+- Your response must start with "{" and end with "}".
+"""
 UNKNOWN_TOKENS = {
     "",
     "N/A",
@@ -117,6 +201,90 @@ custom_style = Style([
     ('selected', 'fg:#cc5454'),
     ('instruction', 'fg:#888888 italic')
 ])
+
+
+class _RetryableVLMServerError(Exception):
+    pass
+
+
+def _looks_like_taskgroup_wrapper(text: str) -> bool:
+    normalized = _clean_value(text).lower()
+    if not normalized:
+        return False
+    return "taskgroup" in normalized or "task group" in normalized
+
+
+def _iter_nested_exceptions(error: BaseException) -> list[BaseException]:
+    stack: list[BaseException] = [error]
+    nested: list[BaseException] = []
+    seen: set[int] = set()
+
+    while stack:
+        current = stack.pop()
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        nested.append(current)
+
+        group_items = getattr(current, "exceptions", None)
+        if isinstance(group_items, (list, tuple)):
+            for item in group_items:
+                if isinstance(item, BaseException):
+                    stack.append(item)
+
+        cause = getattr(current, "__cause__", None)
+        if isinstance(cause, BaseException):
+            stack.append(cause)
+
+        context = getattr(current, "__context__", None)
+        if isinstance(context, BaseException):
+            stack.append(context)
+
+    return nested
+
+
+def _extract_exception_summary(error: BaseException) -> str:
+    # Python 3.11+ ExceptionGroup/TaskGroup errors often hide the real leaf error.
+    specifics: list[str] = []
+    generic_wrappers: list[str] = []
+
+    for item in _iter_nested_exceptions(error):
+        class_name = item.__class__.__name__
+        message = _clean_value(str(item))
+
+        if message:
+            summary = f"{class_name}: {message}"
+        else:
+            summary = class_name
+
+        if _looks_like_taskgroup_wrapper(message):
+            generic_wrappers.append(summary)
+            continue
+
+        specifics.append(summary)
+
+    picked = specifics if specifics else generic_wrappers
+    if not picked:
+        picked = [error.__class__.__name__]
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for part in picked:
+        if part in seen:
+            continue
+        seen.add(part)
+        unique.append(part)
+    return " | ".join(unique[:4])
+
+
+def _is_taskgroup_exception(error: BaseException) -> bool:
+    for item in _iter_nested_exceptions(error):
+        if "exceptiongroup" in item.__class__.__name__.lower():
+            return True
+        if _looks_like_taskgroup_wrapper(str(item)):
+            return True
+    return False
 
 # Data models used to carry image and location metadata.
 @dataclass(slots=True)
@@ -182,8 +350,753 @@ def _merge_hint_values(reg: str, model: str, owner: str, hint: dict[str, str]) -
     """Apply one hint dict onto current values, keeping existing known fields."""
     reg = _prefer_known(reg, hint.get("reg"))
     model = _prefer_known(model, hint.get("model"))
-    owner = (owner, hint.get("owner"))
+    owner = _prefer_known(owner, hint.get("owner"))
     return reg, model, owner
+
+
+def _normalize_compare_text(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]", "", _clean_value(value).lower())
+
+
+def _decision_log(message: str, image_path: Path | None = None, level: str = "INFO") -> None:
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    image_name = image_path.name if image_path else "-"
+    normalized_level = level.upper()
+    line = f"{timestamp} [{normalized_level}] [{image_name}] {message}"
+
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with DECISION_LOG_PATH.open("a", encoding="utf-8") as log_file:
+            log_file.write(line + "\n")
+    except OSError:
+        pass
+
+    style_by_level = {
+        "DEBUG": "cyan",
+        "INFO": "dim",
+        "WARN": "yellow",
+        "WARNING": "yellow",
+        "ERROR": "bold red",
+        "CRITICAL": "bold white on red",
+    }
+    style = style_by_level.get(normalized_level, "dim")
+    console.print(f"  [{style}]{line}[/{style}]")
+
+
+def _build_vlm_candidate_text(candidates: list[dict], max_items: int = 15) -> str:
+    lines = ["當時空域有以下航班："]
+    for candidate in candidates[:max_items]:
+        callsign = _clean_value(str(candidate.get("callsign") or "N/A")) or "N/A"
+        model = _clean_value(str(candidate.get("model") or "N/A")) or "N/A"
+        owner = _clean_value(str(candidate.get("owner") or "N/A")) or "N/A"
+        reg = _clean_value(str(candidate.get("reg") or "N/A")) or "N/A"
+        lines.append(f"- {callsign} (機型: {model}, 航空: {owner}, 機身碼: {reg})")
+    return "\n".join(lines)
+
+
+def _build_vlm_prompt(candidates: list[dict] | None = None) -> str:
+    if not candidates:
+        return VLM_PROMPT_TEXT
+
+    candidate_text = _build_vlm_candidate_text(candidates)
+    return f"""
+請幫我辨識這張照片裡的飛機。
+請注意，這台飛機必定是下面名單中的其中一台，絕對不可猜名單以外的飛機。
+{candidate_text}
+
+請回傳 JSON，格式如下：
+{{
+    "status": "MATCH 或 NOT_IN_RADAR 或 BLURRY",
+    "selected_callsign": "如果是 MATCH，填寫你選中的 callsign，否則填 null",
+    "raw_registration": "肉眼讀到的機身碼，若看不清填 null",
+    "reason": "簡短說明原因",
+    "callsign": "與 selected_callsign 相同，若非 MATCH 則填 null",
+    "registration_number": "與 raw_registration 相同，若看不清填 null",
+  "airline": "airline name",
+  "aircraft_type": "aircraft type"
+}}
+
+【最高指導原則 - 違反將導致系統崩潰】
+- 絕對禁止輸出任何問候語、推理過程或解釋。
+- 絕對禁止使用 ```json 或任何 Markdown 標記包裝。
+- 回應必須直接從 {{ 開始，並以 }} 結束，除此之外不能有任何多餘字元。
+""".strip()
+
+
+def _build_vlm_cache_key(image_path: Path, prompt_text: str | None = None) -> str:
+    try:
+        stat = image_path.stat()
+        base = f"{image_path.resolve()}::{stat.st_mtime_ns}:{stat.st_size}"
+    except OSError:
+        base = str(image_path)
+
+    prompt_hash_source = prompt_text or ""
+    prompt_hash = hashlib.sha256(prompt_hash_source.encode("utf-8")).hexdigest()[:16]
+    return f"{base}::prompt={prompt_hash}"
+
+
+def _read_vlm_cache() -> dict[str, dict[str, str]]:
+    try:
+        if not VLM_CACHE_PATH.exists():
+            return {}
+        loaded = json.loads(VLM_CACHE_PATH.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            return loaded
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _write_vlm_cache(cache: dict[str, dict[str, str]]) -> None:
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        VLM_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=True, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _get_cached_vlm_result(image_path: Path, prompt_text: str | None = None) -> dict[str, str] | None:
+    cache = _read_vlm_cache()
+    key = _build_vlm_cache_key(image_path, prompt_text)
+    cached = cache.get(key)
+    if isinstance(cached, dict):
+        normalized = _normalize_vlm_result(cached)
+        if normalized:
+            _decision_log("use cached VLM result", image_path)
+            return normalized
+    return None
+
+
+def _set_cached_vlm_result(
+    image_path: Path,
+    result: dict[str, str],
+    source: str,
+    prompt_text: str | None = None,
+) -> None:
+    cache = _read_vlm_cache()
+    key = _build_vlm_cache_key(image_path, prompt_text)
+    cache[key] = {
+        "callsign": _clean_value(result.get("callsign")),
+        "registration_number": _clean_value(result.get("registration_number")),
+        "airline": _clean_value(result.get("airline")),
+        "aircraft_type": _clean_value(result.get("aircraft_type")),
+    }
+    _write_vlm_cache(cache)
+    _decision_log(f"cached VLM result source={source}", image_path)
+
+
+def _is_quota_error(error_text: str) -> bool:
+    normalized = error_text.upper()
+    return "RESOURCE_EXHAUSTED" in normalized or "QUOTA" in normalized or "429" in normalized
+
+
+def _is_server_side_error(error_text: str) -> bool:
+    normalized = error_text.upper()
+    server_tokens = (
+        " 500",
+        " 502",
+        " 503",
+        " 504",
+        "UNAVAILABLE",
+        "INTERNAL",
+        "SERVICE UNAVAILABLE",
+        "DEADLINE_EXCEEDED",
+        "SERVER ERROR",
+        "MODEL IS CURRENTLY EXPERIENCING HIGH DEMAND",
+    )
+    return any(token in normalized for token in server_tokens)
+
+
+def _retry_backoff_seconds(retry_index: int) -> float:
+    # retry_index is zero-based (0, 1, 2, ...)
+    delay = VLM_SERVER_RETRY_BASE_SECONDS * (2 ** retry_index)
+    return min(delay, VLM_SERVER_RETRY_MAX_SECONDS)
+
+
+def _cross_vlm_model_for_retry(retry_index: int) -> str:
+    if not VLM_MODEL_BACKUP or VLM_MODEL_BACKUP == VLM_MODEL_PRIMARY:
+        return VLM_MODEL_PRIMARY
+    return VLM_MODEL_PRIMARY if retry_index % 2 == 0 else VLM_MODEL_BACKUP
+
+
+def _try_parse_json_dict(text: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def _parse_vlm_json_payload(raw_text: str, image_path: Path, source: str) -> dict[str, Any] | None:
+    raw = _clean_value(raw_text)
+    if not raw:
+        return None
+
+    direct = _try_parse_json_dict(raw)
+    if direct:
+        return direct
+
+    no_fence = re.sub(r"```(?:json)?", "", raw, flags=re.IGNORECASE).replace("```", "").strip()
+    if no_fence and no_fence != raw:
+        direct_no_fence = _try_parse_json_dict(no_fence)
+        if direct_no_fence:
+            _decision_log(f"{source} payload recovered by removing markdown fences", image_path)
+            return direct_no_fence
+
+    match = re.search(r"\{.*\}", no_fence or raw, re.DOTALL)
+    if match:
+        extracted = match.group(0).strip()
+        parsed_regex = _try_parse_json_dict(extracted)
+        if parsed_regex:
+            _decision_log(f"{source} payload recovered by regex JSON extraction", image_path)
+            return parsed_regex
+
+    decoder = json.JSONDecoder()
+    scan_text = no_fence or raw
+    for index, char in enumerate(scan_text):
+        if char != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(scan_text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            _decision_log(f"{source} payload recovered by JSON decoder scan", image_path)
+            return parsed
+
+    return None
+
+
+def _normalize_vlm_result(parsed: dict[str, Any]) -> dict[str, str] | None:
+    if not isinstance(parsed, dict):
+        return None
+
+    if parsed.get("error"):
+        return None
+
+    status = _clean_value(parsed.get("status")).upper()
+    selected_callsign = _clean_value(parsed.get("selected_callsign"))
+    callsign = _clean_value(parsed.get("callsign")) or selected_callsign
+    if status and status != "MATCH" and not _clean_value(parsed.get("callsign")):
+        callsign = ""
+
+    registration_number = _clean_value(parsed.get("registration_number"))
+    raw_registration = _clean_value(parsed.get("raw_registration"))
+    if not registration_number:
+        registration_number = raw_registration
+
+    return {
+        "callsign": callsign,
+        "registration_number": registration_number,
+        "airline": _clean_value(parsed.get("airline")),
+        "aircraft_type": _clean_value(parsed.get("aircraft_type")),
+    }
+
+
+def _extract_aircraft_family(value: str | None) -> str:
+    text = _clean_value(value).upper()
+    if not text:
+        return ""
+
+    # A320 / A321 / A330 / A350 ...
+    m = re.search(r"\bA\s*(\d{3,4})\b", text)
+    if m:
+        return f"A{m.group(1)[:3]}"
+
+    # B737 / B747 / B777 / B787 ...
+    m = re.search(r"\bB\s*(\d{3,4})\b", text)
+    if m:
+        return f"B{m.group(1)[:3]}"
+
+    # Boeing 747-400 / Airbus A320neo styles without leading A/B token.
+    m = re.search(r"\bBOEING\s*(\d{3,4})\b", text)
+    if m:
+        return f"B{m.group(1)[:3]}"
+
+    m = re.search(r"\bAIRBUS\s*A?\s*(\d{3,4})\b", text)
+    if m:
+        return f"A{m.group(1)[:3]}"
+
+    return ""
+
+
+def _prepare_vlm_image_for_model(image_path: Path) -> Any:
+    import PIL.Image  # type: ignore[import-not-found]
+    import PIL.ImageOps  # type: ignore[import-not-found]
+
+    with PIL.Image.open(image_path) as src:
+        oriented = PIL.ImageOps.exif_transpose(src)
+        prepared = oriented.copy()
+
+    if VLM_MAX_IMAGE_EDGE > 0:
+        original_size = prepared.size
+        longest = max(original_size)
+        if longest > VLM_MAX_IMAGE_EDGE:
+            resampling = getattr(PIL.Image, "Resampling", PIL.Image)
+            prepared.thumbnail((VLM_MAX_IMAGE_EDGE, VLM_MAX_IMAGE_EDGE), resampling.LANCZOS)
+            _decision_log(
+                f"VLM image downscaled {original_size[0]}x{original_size[1]} -> {prepared.width}x{prepared.height}",
+                image_path,
+            )
+
+    return prepared
+
+
+def _safe_call_direct_vlm(image_path: Path, candidates: list[dict] | None = None) -> dict[str, str] | None:
+    _decision_log("start direct Gemini VLM call (MCP fallback)", image_path)
+    vlm_prompt = _build_vlm_prompt(candidates)
+    worker_cancelled = threading.Event()
+
+    cached = _get_cached_vlm_result(image_path, vlm_prompt)
+    if cached:
+        return cached
+
+    api_key = _get_gemini_api_key()
+    if not api_key:
+        _decision_log("direct VLM skipped: missing GEMINI_API_KEY/GOOGLE_API_KEY", image_path, level="WARN")
+        return None
+
+    try:
+        import PIL.Image  # type: ignore[import-not-found]
+        from google import genai  # type: ignore[import-not-found]
+    except Exception:
+        _decision_log("direct VLM skipped: missing google-genai or Pillow", image_path, level="WARN")
+        return None
+
+    def _run_direct_call() -> dict[str, str] | None:
+        for attempt in range(1, VLM_SERVER_RETRY_ATTEMPTS + 1):
+            if worker_cancelled.is_set():
+                return None
+
+            try:
+                img = _prepare_vlm_image_for_model(image_path)
+                client = genai.Client(api_key=api_key)
+                model_name = _cross_vlm_model_for_retry(attempt - 1)
+                try:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=[vlm_prompt, img],
+                    )
+                finally:
+                    try:
+                        img.close()
+                    except Exception:
+                        pass
+
+                if worker_cancelled.is_set():
+                    return None
+
+                result_text = _clean_value(getattr(response, "text", ""))
+                _decision_log(f"direct VLM raw response model={model_name}: {result_text[:240]}", image_path)
+                parsed = _parse_vlm_json_payload(result_text, image_path, source="direct")
+                if not parsed:
+                    _decision_log("direct VLM returned unusable payload", image_path, level="WARN")
+                    return None
+                normalized = _normalize_vlm_result(parsed)
+                if not normalized:
+                    _decision_log("direct VLM normalized payload is empty", image_path, level="WARN")
+                    return None
+
+                if worker_cancelled.is_set():
+                    return None
+
+                _set_cached_vlm_result(image_path, normalized, source="direct", prompt_text=vlm_prompt)
+                _decision_log(
+                    f"direct VLM normalized model={model_name} callsign={normalized['callsign'] or 'N/A'}, reg={normalized['registration_number'] or 'N/A'}, airline={normalized['airline'] or 'N/A'}, type={normalized['aircraft_type'] or 'N/A'}",
+                    image_path,
+                )
+                return normalized
+            except Exception as e:
+                error_text = str(e)
+                if (_is_server_side_error(error_text) or _is_quota_error(error_text)) and attempt < VLM_SERVER_RETRY_ATTEMPTS:
+                    if worker_cancelled.is_set():
+                        return None
+                    wait_seconds = _retry_backoff_seconds(attempt - 1)
+                    next_model = _cross_vlm_model_for_retry(attempt)
+                    _decision_log(
+                        f"direct VLM retryable error model={_cross_vlm_model_for_retry(attempt - 1)} attempt={attempt}/{VLM_SERVER_RETRY_ATTEMPTS}; cross-fallback -> {next_model}; retry in {wait_seconds:.1f}s; error={error_text}",
+                        image_path,
+                        level="WARN",
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                raise
+        return None
+
+    try:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(_run_direct_call)
+        timed_out = False
+        try:
+            return future.result(timeout=VLM_DIRECT_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            if VLM_DIRECT_TIMEOUT_GRACE_SECONDS > 0:
+                _decision_log(
+                    f"direct VLM reached {VLM_DIRECT_TIMEOUT_SECONDS}s; waiting additional grace {VLM_DIRECT_TIMEOUT_GRACE_SECONDS:.1f}s",
+                    image_path,
+                    level="WARN",
+                )
+                try:
+                    recovered = future.result(timeout=VLM_DIRECT_TIMEOUT_GRACE_SECONDS)
+                    if recovered:
+                        _decision_log("direct VLM completed during grace window", image_path)
+                    return recovered
+                except concurrent.futures.TimeoutError:
+                    pass
+
+            timed_out = True
+            worker_cancelled.set()
+            future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            _decision_log("direct VLM worker detached after timeout", image_path, level="WARN")
+            raise
+        finally:
+            if not timed_out:
+                executor.shutdown(wait=True, cancel_futures=False)
+    except concurrent.futures.TimeoutError:
+        _decision_log(
+            f"direct VLM timeout after {VLM_DIRECT_TIMEOUT_SECONDS}s (+{VLM_DIRECT_TIMEOUT_GRACE_SECONDS:.1f}s grace)",
+            image_path,
+            level="WARN",
+        )
+        return None
+    except Exception as e:
+        error_text = str(e)
+        _decision_log(f"direct VLM call exception: {error_text}", image_path, level="WARN")
+        return None
+
+
+def _safe_call_mcp_vlm(image_path: Path, candidates: list[dict] | None = None) -> dict[str, str] | None:
+    _decision_log("start MCP VLM call", image_path)
+    vlm_prompt = _build_vlm_prompt(candidates)
+
+    cached = _get_cached_vlm_result(image_path, vlm_prompt)
+    if cached:
+        return cached
+
+    try:
+        from mcp import ClientSession, StdioServerParameters  # type: ignore[import-not-found]
+        from mcp.client.stdio import stdio_client  # type: ignore[import-not-found]
+    except Exception:
+        _decision_log("MCP client package not installed", image_path, level="WARN")
+        console.print("[yellow]未安裝 MCP client 套件，改用 direct VLM fallback。[/yellow]")
+        return _safe_call_direct_vlm(image_path, candidates)
+
+    if not MCP_SERVER_SCRIPT.exists():
+        _decision_log(f"MCP server script missing: {MCP_SERVER_SCRIPT}", image_path, level="WARN")
+        console.print(f"[yellow]找不到 MCP Server: {MCP_SERVER_SCRIPT}，改用 direct VLM fallback。[/yellow]")
+        return _safe_call_direct_vlm(image_path, candidates)
+
+    if not _get_gemini_api_key():
+        _decision_log("missing GEMINI_API_KEY/GOOGLE_API_KEY", image_path, level="WARN")
+        console.print("[yellow]尚未設定 GEMINI_API_KEY/GOOGLE_API_KEY，略過 VLM 自動判斷。[/yellow]")
+        return None
+
+    async def _run() -> dict[str, str] | None:
+        server_params = StdioServerParameters(
+            command=sys.executable,
+            args=[str(MCP_SERVER_SCRIPT)],
+        )
+
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await asyncio.wait_for(session.initialize(), timeout=VLM_MCP_TIMEOUT_SECONDS)
+                result = await asyncio.wait_for(
+                    session.call_tool(
+                        VLM_TOOL_NAME,
+                        arguments={"image_path": str(image_path), "prompt_text": vlm_prompt},
+                    ),
+                    timeout=VLM_MCP_TIMEOUT_SECONDS,
+                )
+
+                content = getattr(result, "content", []) or []
+                text_chunks = [item.text for item in content if getattr(item, "text", None)]
+                if not text_chunks:
+                    _decision_log("MCP tool returned empty content", image_path, level="WARN")
+                    return None
+
+                raw = "\n".join(text_chunks).strip()
+                _decision_log(f"MCP raw response: {raw[:240]}", image_path)
+                parsed = _parse_vlm_json_payload(raw, image_path, source="mcp")
+                if not parsed:
+                    _decision_log("VLM response is not valid JSON", image_path, level="WARN")
+                    console.print(f"[yellow]VLM 回傳非 JSON，略過：{raw[:120]}[/yellow]")
+                    return None
+
+                if parsed.get("error"):
+                    error_text = str(parsed.get("error"))
+                    _decision_log(f"VLM tool error: {error_text}", image_path, level="WARN")
+                    if _is_server_side_error(error_text):
+                        raise _RetryableVLMServerError(error_text)
+                    if _is_quota_error(error_text):
+                        _decision_log("Gemini quota exhausted; VLM auto-selection unavailable until quota resets", image_path, level="WARN")
+                    console.print(f"[yellow]VLM 工具錯誤：{parsed.get('error')}[/yellow]")
+                    return None
+
+                normalized = _normalize_vlm_result(parsed)
+                if not normalized:
+                    _decision_log("VLM response JSON is not usable after normalization", image_path, level="WARN")
+                    return None
+                _set_cached_vlm_result(image_path, normalized, source="mcp", prompt_text=vlm_prompt)
+                _decision_log(
+                    f"normalized VLM fields callsign={normalized['callsign'] or 'N/A'}, reg={normalized['registration_number'] or 'N/A'}, airline={normalized['airline'] or 'N/A'}, type={normalized['aircraft_type'] or 'N/A'}",
+                    image_path,
+                )
+                return normalized
+
+    for attempt in range(1, VLM_SERVER_RETRY_ATTEMPTS + 1):
+        try:
+            return asyncio.run(_run())
+        except asyncio.TimeoutError:
+            _decision_log(
+                f"MCP VLM timeout after {VLM_MCP_TIMEOUT_SECONDS}s",
+                image_path,
+                level="WARN",
+            )
+            console.print(f"[yellow]VLM MCP timeout，改用 direct VLM fallback。[/yellow]")
+            return _safe_call_direct_vlm(image_path, candidates)
+        except _RetryableVLMServerError as e:
+            error_text = str(e)
+            if attempt < VLM_SERVER_RETRY_ATTEMPTS:
+                wait_seconds = _retry_backoff_seconds(attempt - 1)
+                _decision_log(
+                    f"MCP VLM server-side error attempt={attempt}/{VLM_SERVER_RETRY_ATTEMPTS}; retry in {wait_seconds:.1f}s; error={error_text}",
+                    image_path,
+                    level="WARN",
+                )
+                time.sleep(wait_seconds)
+                continue
+            _decision_log(f"MCP VLM server-side retries exhausted: {error_text}", image_path, level="WARN")
+            console.print("[yellow]VLM MCP 伺服器忙碌，重試後仍失敗，改用 direct VLM fallback。[/yellow]")
+            return _safe_call_direct_vlm(image_path, candidates)
+        except Exception as e:
+            error_text = _extract_exception_summary(e)
+            if _is_server_side_error(error_text) and attempt < VLM_SERVER_RETRY_ATTEMPTS:
+                wait_seconds = _retry_backoff_seconds(attempt - 1)
+                _decision_log(
+                    f"MCP VLM call exception (retryable) attempt={attempt}/{VLM_SERVER_RETRY_ATTEMPTS}; retry in {wait_seconds:.1f}s; error={error_text}",
+                    image_path,
+                    level="WARN",
+                )
+                time.sleep(wait_seconds)
+                continue
+            if _is_taskgroup_exception(e):
+                _decision_log(f"MCP VLM transport exception: {error_text}", image_path, level="WARN")
+                console.print("[yellow]VLM MCP 通道異常，改用 direct VLM fallback。[/yellow]")
+            else:
+                _decision_log(f"MCP VLM call exception: {error_text}", image_path, level="WARN")
+                console.print(f"[yellow]VLM MCP 呼叫失敗，改用 direct VLM fallback：{error_text}[/yellow]")
+            return _safe_call_direct_vlm(image_path, candidates)
+
+    return _safe_call_direct_vlm(image_path, candidates)
+
+
+def _score_candidate_with_vlm(candidate: dict, vlm_result: dict[str, str]) -> tuple[int, list[str]]:
+    score = 0
+    reasons: list[str] = []
+
+    vlm_callsign = _normalize_compare_text(vlm_result.get("callsign"))
+    candidate_callsign = _normalize_compare_text(candidate.get("callsign"))
+    if vlm_callsign and candidate_callsign:
+        if vlm_callsign == candidate_callsign:
+            score += 8
+            reasons.append("callsign exact")
+        elif vlm_callsign in candidate_callsign or candidate_callsign in vlm_callsign:
+            score += 4
+            reasons.append("callsign partial")
+
+    vlm_reg = _normalize_reg(vlm_result.get("registration_number"))
+    candidate_reg = _normalize_reg(candidate.get("reg"))
+    if vlm_reg and candidate_reg:
+        if vlm_reg == candidate_reg:
+            score += 6
+            reasons.append("registration exact")
+        elif vlm_reg in candidate_reg or candidate_reg in vlm_reg:
+            score += 3
+            reasons.append("registration partial")
+        else:
+            common_prefix_len = 0
+            for a, b in zip(vlm_reg, candidate_reg):
+                if a != b:
+                    break
+                common_prefix_len += 1
+
+            # Partial registrations can miss trailing characters,
+            # but short prefixes like "B-18" are too broad.
+            if common_prefix_len >= 5:
+                score += 2
+                reasons.append("registration prefix")
+
+    vlm_airline = _normalize_compare_text(vlm_result.get("airline"))
+    candidate_airline = _normalize_compare_text(candidate.get("owner"))
+    if vlm_airline and candidate_airline:
+        if vlm_airline == candidate_airline:
+            score += 3
+            reasons.append("airline exact")
+        elif vlm_airline in candidate_airline or candidate_airline in vlm_airline:
+            score += 2
+            reasons.append("airline partial")
+
+    vlm_type = _normalize_compare_text(vlm_result.get("aircraft_type"))
+    candidate_type = _normalize_compare_text(candidate.get("model"))
+    if vlm_type and candidate_type:
+        if vlm_type == candidate_type:
+            score += 2
+            reasons.append("type exact")
+        elif vlm_type in candidate_type or candidate_type in vlm_type:
+            score += 1
+            reasons.append("type partial")
+
+    vlm_family = _extract_aircraft_family(vlm_result.get("aircraft_type"))
+    candidate_family = _extract_aircraft_family(candidate.get("model"))
+    if vlm_family and candidate_family and vlm_family == candidate_family:
+        score += 1
+        reasons.append("type family")
+
+    return score, reasons
+
+
+def _select_candidate_by_vlm(candidates: list[dict], image_path: Path) -> dict | None:
+    vlm_result = _safe_call_mcp_vlm(image_path, candidates)
+    if not vlm_result:
+        _decision_log("no usable VLM result for candidate scoring", image_path, level="WARN")
+        return None
+
+    vlm_callsign = _normalize_compare_text(vlm_result.get("callsign"))
+    if vlm_callsign:
+        exact_callsign_matches = [
+            candidate
+            for candidate in candidates
+            if _normalize_compare_text(candidate.get("callsign")) == vlm_callsign
+        ]
+        if len(exact_callsign_matches) == 1:
+            picked = exact_callsign_matches[0]
+            _decision_log(
+                f"auto selected by callsign match callsign={picked.get('callsign')}",
+                image_path,
+            )
+            console.print(f"[cyan]VLM 自動選定(名單 callsign 直選): {picked['callsign']}[/cyan]")
+            return picked
+
+    scored: list[tuple[int, list[str], dict]] = []
+    for candidate in candidates:
+        score, reasons = _score_candidate_with_vlm(candidate, vlm_result)
+        reason_text = ",".join(reasons) if reasons else "none"
+        _decision_log(
+            f"candidate score callsign={candidate.get('callsign')} reg={candidate.get('reg')} model={candidate.get('model')} owner={candidate.get('owner')} score={score} reasons={reason_text}",
+            image_path,
+        )
+        scored.append((score, reasons, candidate))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_reasons, best_candidate = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else -1
+    second_reasons = scored[1][1] if len(scored) > 1 else []
+    airline_exact_count = sum(1 for _, reasons, _ in scored if "airline exact" in reasons)
+
+    def _reason_rank(reasons: list[str]) -> int:
+        rank = 0
+        if "registration exact" in reasons:
+            rank += 6
+        elif "registration partial" in reasons:
+            rank += 4
+        elif "registration prefix" in reasons:
+            rank += 2
+
+        if "type exact" in reasons:
+            rank += 3
+        elif "type partial" in reasons:
+            rank += 2
+        elif "type family" in reasons:
+            rank += 1
+
+        if "airline exact" in reasons:
+            rank += 2
+        elif "airline partial" in reasons:
+            rank += 1
+
+        return rank
+
+    best_rank = _reason_rank(best_reasons)
+    second_rank = _reason_rank(second_reasons)
+    _decision_log(
+        f"best_score={best_score}, second_score={second_score}, best_rank={best_rank}, second_rank={second_rank}, airline_exact_count={airline_exact_count}, threshold_min={VLM_MIN_SCORE}, threshold_margin={VLM_SCORE_MARGIN}",
+        image_path,
+    )
+
+    if best_score < VLM_MIN_SCORE:
+        if (
+            VLM_ALLOW_LOW_CONF_AIRLINE_EXACT
+            and best_score == (VLM_MIN_SCORE - 1)
+            and second_score <= 1
+            and "airline exact" in best_reasons
+            and airline_exact_count == 1
+        ):
+            reason_text = ", ".join(best_reasons) if best_reasons else "feature match"
+            _decision_log(
+                f"auto selected by low-conf airline-exact rule callsign={best_candidate.get('callsign')} score={best_score} reasons={reason_text}",
+                image_path,
+            )
+            console.print(
+                f"[cyan]VLM 自動選定(低信心放行): {best_candidate['callsign']} (score={best_score}, reason={reason_text})[/cyan]"
+            )
+            return best_candidate
+
+        _decision_log("fallback to manual selection: best score below minimum", image_path, level="WARN")
+        console.print("[yellow]VLM 判斷分數不足，改由人工選擇。[/yellow]")
+        return None
+
+    if (best_score - second_score) < VLM_SCORE_MARGIN:
+        # If scores are close, allow stronger semantic match signals to break ties.
+        if best_score >= VLM_MIN_SCORE and best_rank > second_rank:
+            reason_text = ", ".join(best_reasons) if best_reasons else "feature match"
+            _decision_log(
+                f"auto selected by tie-break callsign={best_candidate.get('callsign')} score={best_score} rank={best_rank}>{second_rank} reasons={reason_text}",
+                image_path,
+            )
+            console.print(
+                f"[cyan]VLM 自動選定(近分決勝): {best_candidate['callsign']} (score={best_score}, reason={reason_text})[/cyan]"
+            )
+            return best_candidate
+
+        _decision_log("fallback to manual selection: score gap below margin", image_path, level="WARN")
+        console.print("[yellow]VLM 判斷不夠明確，改由人工選擇。[/yellow]")
+        return None
+
+    reason_text = ", ".join(best_reasons) if best_reasons else "feature match"
+    _decision_log(
+        f"auto selected by VLM callsign={best_candidate.get('callsign')} score={best_score} reasons={reason_text}",
+        image_path,
+    )
+    console.print(
+        f"[cyan]VLM 自動選定: {best_candidate['callsign']} (score={best_score}, reason={reason_text})[/cyan]"
+    )
+    return best_candidate
+
+
+def _build_vlm_only_candidate(vlm_result: dict[str, str]) -> dict | None:
+    reg = _normalize_reg(vlm_result.get("registration_number"))
+    owner = _clean_value(vlm_result.get("airline"))
+    model = _clean_value(vlm_result.get("aircraft_type"))
+
+    reg = "N/A" if _is_unknown(reg) else reg
+    owner = "N/A" if _is_unknown(owner) else owner
+    model = "N/A" if _is_unknown(model) else model
+
+    if reg == "N/A" and owner == "N/A" and model == "N/A":
+        return None
+
+    callsign = "N/A"
+    return {
+        "icao": "N/A",
+        "callsign": callsign,
+        "reg": reg,
+        "model": model,
+        "owner": owner,
+        "display": f"{callsign:<8} | Reg: {reg:<8} | Model: {model:<28} | Airline: {owner}",
+    }
 
 
 def _upsert_known_hint(icao: str, callsign: str, reg: str, model: str, owner: str) -> None:
@@ -452,6 +1365,13 @@ def _init_traffic_db() -> Any | None:
     if traffic_db_disabled:
         return None
 
+    if not _is_traffic_supported_python():
+        traffic_db_disabled = True
+        console.print(
+            f"[yellow]偵測到不受支援的 Python 版本，略過 traffic 離線補值。{_traffic_python_hint()}[/yellow]"
+        )
+        return None
+
     if traffic_db_initialized:
         return traffic_db_frame
 
@@ -469,7 +1389,10 @@ def _init_traffic_db() -> Any | None:
     if traffic_aircraft is None:
         traffic_db_disabled = True
         detail = f" ({traffic_import_error})" if traffic_import_error else ""
-        console.print(f"[yellow]無法載入 traffic，略過 traffic 離線補值。請確認已安裝相依套件: pip install traffic pandas{detail}[/yellow]")
+        console.print(
+            "[yellow]無法載入 traffic，略過 traffic 離線補值。"
+            f"請確認已安裝相依套件: pip install traffic pandas。{_traffic_python_hint()}{detail}[/yellow]"
+        )
         return None
 
     try:
@@ -1036,6 +1959,20 @@ def write_metadata(image_path: Path, plane: dict):
         piexif.insert(piexif.dump(exif_dict), str(image_path))
 
 
+def write_sidecar_json(image_path: Path, payload: dict[str, Any]) -> None:
+    """Always write per-image JSON result next to the image file."""
+    sidecar_path = image_path.with_suffix('.json')
+    try:
+        sidecar_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        _decision_log(f"failed to write sidecar json: {e}", image_path, level="WARN")
+        return
+    _decision_log(f"sidecar json written: {sidecar_path.name}", image_path)
+
+
 def _remember_selected_candidate(candidate: dict) -> None:
     _upsert_known_hint(
         _normalize_icao(candidate.get("icao", "N/A")),
@@ -1067,7 +2004,8 @@ def _to_utc(exif: ExifMetadata, timezone_name: str) -> datetime:
     return exif.captured_at_local.replace(tzinfo=ZoneInfo(timezone_name)).astimezone(timezone.utc)
 
 
-def _prompt_candidate(candidates: list[dict], image_name: str) -> dict | None:
+def _prompt_candidate(candidates: list[dict], image_name: str, image_path: Path | None = None) -> dict | None:
+    _decision_log(f"manual prompt opened with {len(candidates)} candidates", image_path)
     selected = questionary.select(
         f"請為 {image_name} 選擇正確航班：",
         choices=[questionary.Choice(candidate['display'], value=candidate) for candidate in candidates] + [questionary.Separator(), questionary.Choice("跳過此照片", value="__SKIP__")],
@@ -1075,7 +2013,12 @@ def _prompt_candidate(candidates: list[dict], image_name: str) -> dict | None:
     ).ask()
 
     if isinstance(selected, dict):
+        _decision_log(
+            f"manual prompt selected callsign={selected.get('callsign')} reg={selected.get('reg')}",
+            image_path,
+        )
         return selected
+    _decision_log("manual prompt returned skip", image_path, level="WARN")
     return None
 
 
@@ -1085,6 +2028,12 @@ def refresh_aircraft_db() -> None:
     global traffic_db_disabled
     global traffic_db_initialized
     global traffic_db_frame
+
+    if not _is_traffic_supported_python():
+        console.print(
+            f"[red]目前 Python 版本不建議使用 traffic。{_traffic_python_hint()}[/red]"
+        )
+        raise typer.Exit(code=1)
 
     try:
         traffic_data = importlib.import_module("traffic.data")
@@ -1131,24 +2080,139 @@ def process(target: Path = typer.Argument(...), recursive: bool = False):
     cached_loc = None
     for idx, img in enumerate(files, 1):
         console.rule(f"[bold blue]({idx}/{len(files)}) {img.name}")
+        _decision_log(f"start processing image ({idx}/{len(files)})", img)
         exif = read_exif_metadata(img)
+        branch = "unknown"
 
         cached_loc = _resolve_location_context(exif, cached_loc)
         utc_time = _to_utc(exif, cached_loc.timezone_name)
         console.print(f"  [dim]時區: {cached_loc.timezone_name} | UTC: {utc_time.strftime('%Y-%m-%d %H:%M:%S')}[/dim]")
+        _decision_log(
+            f"location lat={cached_loc.latitude:.5f}, lon={cached_loc.longitude:.5f}, tz={cached_loc.timezone_name}, utc={utc_time.strftime('%Y-%m-%dT%H:%M:%SZ')}",
+            img,
+        )
 
         candidates = query_nas_history(cached_loc.latitude, cached_loc.longitude, utc_time)
+        _decision_log(f"radar candidate count={len(candidates)}", img)
+
+        selected: dict | None = None
 
         if not candidates:
-            console.print("  [yellow]查無航班，跳過。[/yellow]")
-            continue
+            branch = "no-candidate"
+            _decision_log("branch=no-candidate; trying VLM-only", img)
+            console.print("  [yellow]try VLM[/yellow]")
+            vlm_result = _safe_call_mcp_vlm(img)
+            if vlm_result:
+                selected = _build_vlm_only_candidate(vlm_result)
+                if selected:
+                    _decision_log("VLM-only candidate built successfully", img)
+                    console.print("  [cyan]VLM hit[/cyan]")
+            if not selected:
+                _decision_log("no-candidate branch failed to resolve by VLM", img, level="WARN")
+                console.print("  [yellow]VLM miss, skip[/yellow]")
+                write_sidecar_json(
+                    img,
+                    {
+                        "status": "skipped",
+                        "reason": "no_candidate_and_vlm_unresolved",
+                        "image": str(img),
+                        "captured_at_local": exif.raw_datetime,
+                        "utc_time": utc_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "location": {
+                            "lat": cached_loc.latitude,
+                            "lon": cached_loc.longitude,
+                            "timezone": cached_loc.timezone_name,
+                        },
+                        "candidate_count": 0,
+                        "branch": branch,
+                        "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    },
+                )
+                continue
+        elif len(candidates) == 1:
+            branch = "single-candidate"
+            selected = candidates[0]
+            _decision_log(f"branch=single-candidate; auto-selected {selected.get('callsign')}", img)
+            console.print(f"  [cyan]單一候選，自動選定: {selected['callsign']}[/cyan]")
+        else:
+            branch = "multi-candidate"
+            
+            console.print("  [dim]啟動本機 Edge OCR 嘗試快速配對...[/dim]")
+            ocr_marks = extract_registration_marks(str(img), YOLO_WEIGHTS_PATH)
+            
+            if ocr_marks:
+                _decision_log(f"local OCR found marks: {ocr_marks}", img)
+                for mark in ocr_marks:
+                    normalized_mark = _normalize_reg(mark)
+                    for candidate in candidates:
+                        if _normalize_reg(candidate.get("reg")) == normalized_mark:
+                            selected = candidate
+                            _decision_log(f"auto selected by local OCR match reg={normalized_mark}", img)
+                            console.print(f"  [cyan]OCR: {selected['callsign']} (Reg: {normalized_mark})[/cyan]")
+                            break
+                    if selected:
+                        break
 
-        selected = _prompt_candidate(candidates, img.name)
+            if not selected:
+                _decision_log("branch=multi-candidate; local OCR missed, trying VLM scoring", img)
+                console.print("  [dim]OCR missed, VLM selecting...[/dim]")
+                selected = _select_candidate_by_vlm(candidates, img)
+                
+            if not selected:
+                selected = _prompt_candidate(candidates, img.name, img)
 
         if selected:
             _remember_selected_candidate(selected)
             write_metadata(img, selected)
+            write_sidecar_json(
+                img,
+                {
+                    "status": "selected",
+                    "image": str(img),
+                    "captured_at_local": exif.raw_datetime,
+                    "utc_time": utc_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "location": {
+                        "lat": cached_loc.latitude,
+                        "lon": cached_loc.longitude,
+                        "timezone": cached_loc.timezone_name,
+                    },
+                    "candidate_count": len(candidates),
+                    "branch": branch,
+                    "selected": {
+                        "icao": selected.get("icao"),
+                        "callsign": selected.get("callsign"),
+                        "registration": selected.get("reg"),
+                        "aircraft_type": selected.get("model"),
+                        "airline": selected.get("owner"),
+                        "display": selected.get("display"),
+                    },
+                    "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                },
+            )
+            _decision_log(
+                f"metadata written callsign={selected.get('callsign')} reg={selected.get('reg')} model={selected.get('model')} owner={selected.get('owner')}",
+                img,
+            )
             console.print(f"  [green]✅ 已標註: {selected['callsign']}[/green]")
+        else:
+            write_sidecar_json(
+                img,
+                {
+                    "status": "skipped",
+                    "reason": "manual_skip_or_unresolved",
+                    "image": str(img),
+                    "captured_at_local": exif.raw_datetime,
+                    "utc_time": utc_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "location": {
+                        "lat": cached_loc.latitude,
+                        "lon": cached_loc.longitude,
+                        "timezone": cached_loc.timezone_name,
+                    },
+                    "candidate_count": len(candidates),
+                    "branch": branch,
+                    "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                },
+            )
 
 if __name__ == "__main__":
     app()

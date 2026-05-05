@@ -1,0 +1,22 @@
+{
+  "status": "selected",
+  "image": "test/123.jpg",
+  "captured_at_local": "2026:04:28 18:20:40",
+  "utc_time": "2026-04-28T10:20:40Z",
+  "location": {
+    "lat": 25.056416,
+    "lon": 121.217254,
+    "timezone": "Asia/Taipei"
+  },
+  "candidate_count": 7,
+  "branch": "multi-candidate",
+  "selected": {
+    "icao": "88596c",
+    "callsign": "TVJ568",
+    "registration": "HS-VKL",
+    "aircraft_type": "Airbus A321-200",
+    "airline": "Thai Vietjet Air",
+    "display": "TVJ568   | Reg: HS-VKL   | Model: Airbus A321-200              | Airline: Thai Vietjet Air"
+  },
+  "generated_at_utc": "2026-05-05T22:15:06Z"
+}
