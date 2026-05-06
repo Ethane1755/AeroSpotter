@@ -4,6 +4,7 @@ import re
 import warnings
 from typing import List
 
+# Detector-first OCR pipeline for extracting aircraft registration marks.
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import cv2

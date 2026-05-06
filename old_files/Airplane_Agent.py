@@ -4,6 +4,7 @@ import os
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+# Legacy AutoGen batch workflow for aircraft summarization.
 # ==========================================
 # 1. Setup the Brain (phi4-mini)
 # ==========================================

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# Phi-4-backed variant of the main aircraft identification workflow.
 import json
 import os
 from pathlib import Path

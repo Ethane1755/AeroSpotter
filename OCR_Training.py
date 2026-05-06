@@ -1,5 +1,6 @@
 from ultralytics import YOLO
 
+# YOLO training script for the local OCR detector.
 model = YOLO('yolov8n.pt')
 
 results = model.train(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# Main orchestration CLI for radar, OCR, and VLM-based aircraft identification.
 import asyncio
 import concurrent.futures
 import csv

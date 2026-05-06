@@ -4,6 +4,7 @@ import time
 import PIL.Image
 from google import genai
 
+# Legacy standalone Gemini batch VLM testing script.
 
 def load_dotenv_file(path: str = ".env") -> None:
     if not os.path.exists(path):

@@ -10,6 +10,7 @@ import PIL.ImageOps
 from google import genai
 from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
 
+# MCP server that exposes aircraft VLM analysis as a callable tool.
 
 def load_dotenv_file(path: str = ".env") -> None:
     if not os.path.exists(path):
