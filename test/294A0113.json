@@ -1,0 +1,22 @@
+{
+  "status": "selected",
+  "image": "test/294A0113.jpg",
+  "captured_at_local": "2026:04:28 18:31:35",
+  "utc_time": "2026-04-28T10:31:35Z",
+  "location": {
+    "lat": 25.056926,
+    "lon": 121.217464,
+    "timezone": "Asia/Taipei"
+  },
+  "candidate_count": 14,
+  "branch": "multi-candidate",
+  "selected": {
+    "icao": "789237",
+    "callsign": "CPA504",
+    "registration": "B-HNX",
+    "aircraft_type": "B773",
+    "airline": "Cathay Pacific",
+    "display": "CPA504   | Reg: B-HNX    | Model: B773                         | Airline: Cathay Pacific"
+  },
+  "generated_at_utc": "2026-05-06T15:02:34Z"
+}
